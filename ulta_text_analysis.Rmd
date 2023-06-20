@@ -1,0 +1,1219 @@
+---
+title: "Ulta Text Analysis"
+author: Andrew Mashhadi
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: pdf_document
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen=999)
+```
+
+# Load Libraries
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidytext) 
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(stringr)
+```
+
+# Analysis
+
+Reading in the the full dataframe of webscraped data \texttt{full\_df}.
+
+&nbsp;&nbsp;
+```{r}
+
+## set data path
+PATH_ULTA_TEXT_DIR <- Sys.getenv("ULTA_TEXT_DATA")
+PATH_ULTA_PRODUCT_NAMES <-paste0(PATH_ULTA_TEXT_DIR, '/products/product_dict.csv')
+
+## read in product names
+product_names <- read.csv(PATH_ULTA_PRODUCT_NAMES)[, 2:3]
+
+## get full paths to all data files
+csv_files <- list.files(PATH_ULTA_TEXT_DIR, pattern = "csv$", full.names = T)
+brand_names <- list.files(PATH_ULTA_TEXT_DIR, pattern = "csv$", full.names = F)
+
+# initiallize df
+full_df <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(full_df) <- c('id', 'class', 'text', 'reviews', 
+                       'rating', 'price', 'brand')
+
+## read in product names
+for (i in 1:length(csv_files)) {
+  
+  tmp <- read.csv(csv_files[i])[, 2:7]
+
+  tmp <- tmp %>% 
+    mutate(brand=str_replace(brand_names[i], ".csv", ""))
+  
+  full_df <- rbind(full_df, tmp)
+  
+}
+
+# remove duplicates (sometimes same product page woudl appear a few times)
+full_df <- full_df %>% 
+  distinct()
+
+full_df <- full_df %>% 
+  group_by(id) %>% 
+  mutate(rev_num=1:n()) %>% 
+  ungroup()
+
+
+# join with product names found seperately
+full_df <- full_df %>% 
+   inner_join(product_names %>% 
+                distinct())
+
+
+```
+&nbsp;&nbsp;
+
+Create dataframe for each word in each review.
+
+&nbsp;&nbsp;
+```{r}
+
+ona_df_og <- full_df %>% 
+   na.omit() %>% 
+   filter(reviews != "")
+
+tidy_revs <- ona_df_og %>% 
+   unnest_tokens(word, reviews) %>% 
+   filter(!grepl('[0-9]', word)) %>%
+   mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+   anti_join(stop_words)
+
+
+tidy_revs %>% 
+  count(word, sort=T) %>% 
+  head(n=10)
+
+```
+&nbsp;&nbsp;
+
+We now build word cloud of words for positive reviews.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE, fig.align='center'}
+
+# load library
+library(wordcloud)
+
+# set seed
+set.seed(1128)
+
+tidy_revs %>% 
+  filter(rating > 4.5) %>% 
+  filter(!(word %in% c("hair", "product"))) %>% 
+  count(word) %>% 
+  with(wordcloud(word, n, max.words = 100, colors = "blue"))
+
+```
+&nbsp;&nbsp;
+
+We now build word cloud of words for negative reviews.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE, fig.align='center'}
+
+# set seed
+set.seed(1128)
+
+tidy_revs %>% 
+  filter(rating < 1.5) %>% 
+  filter(!(word %in% c("hair", "product"))) %>% 
+  count(word) %>% 
+  with(wordcloud(word, n, max.words = 100, colors = "red"))
+
+
+```
+&nbsp;&nbsp;
+
+Get sentiment per product. Join sentiment to main dataframe.
+
+&nbsp;&nbsp;
+```{r}
+
+# get sentiments for each review
+rev_sents <- tidy_revs %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  group_by(id, rev_num) %>% 
+  summarise(sentiment = sum(value))
+
+# treat each review equally (with weight) then get prop. positive
+rev_sents <- rev_sents %>% 
+  filter(sentiment != 0) %>% 
+  mutate(sentiment=as.integer(sentiment > 0)) %>% 
+  group_by(id) %>% 
+  summarise(pos_sentiment=mean(sentiment))
+
+
+# merge sentiments with reviews
+ona_df <- ona_df_og %>% 
+  inner_join(rev_sents, by="id") %>% 
+  group_by(id) %>%
+  slice(1) %>% 
+  ungroup() %>% 
+  select(-c(reviews, rev_num))
+
+```
+&nbsp;&nbsp;
+
+Correlation test between sentiment scores and star ratings. Sample 100 products and demonstrate the effectiveness of the sentiment analysis with a plot.
+
+&nbsp;&nbsp;
+```{r}
+
+# correlation test
+cor.test(ona_df$rating, ona_df$pos_sentiment)
+
+
+# sentiment vs star rating evaluation figure
+set.seed(19)
+samp_df <- slice_sample(ona_df, n = 100)
+
+bind_rows(samp_df %>% 
+            mutate(rating_type="Sentment Score", 
+                   rev_rating=pos_sentiment) %>% 
+            select(-c(rating, pos_sentiment, text)), 
+          samp_df %>% 
+            mutate(rating_type="Star Rating", 
+                   rev_rating=rating) %>% 
+            select(-c(rating, pos_sentiment, text))) %>%
+  ggplot(aes(name, rev_rating, fill = rating_type)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~rating_type, ncol = 1, scales = "free_y") +
+  theme(axis.text.x=element_blank(),
+      axis.ticks.x=element_blank()) +
+  xlab("Product") + 
+  ylab("Rating")
+
+```
+&nbsp;&nbsp;
+
+## Using Sentiment and Rating with Description
+
+All description words by sentiment and rating.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE}
+
+tidy_desc <- ona_df %>% 
+  filter(pos_sentiment != 0.5) %>% 
+  mutate(sentiment = case_when( 
+                            pos_sentiment < 0.5 ~ "negative",
+                            pos_sentiment > 0.5 ~ "positive")) %>% 
+  select(-c(pos_sentiment)) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+
+tidy_desc %>% 
+  count(sentiment, word, sort = TRUE) %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 10) %>% 
+  mutate(word = reorder(word, n))
+  
+A <- tidy_desc %>% 
+     count(sentiment, word, sort = TRUE) %>%
+     ungroup() %>% 
+     filter(sentiment=="negative") %>% 
+     slice_max(n, n = 10) %>% 
+     mutate(word = reorder(word, n)) %>%
+     ggplot(aes(n, word)) +
+     geom_col(show.legend = FALSE, fill="#F8766D") +
+     facet_wrap(~sentiment, scales = "free_y") +
+     labs(x = "Contribution to sentiment",
+          y = NULL)
+
+B <- tidy_desc %>% 
+     count(sentiment, word, sort = TRUE) %>%
+     ungroup() %>% 
+     filter(sentiment=="positive") %>% 
+     slice_max(n, n = 10) %>% 
+     mutate(word = reorder(word, n)) %>%
+     ggplot(aes(n, word)) +
+     geom_col(show.legend = FALSE, fill="#00BFC4") +
+     facet_wrap(~sentiment, scales = "free_y") +
+     labs(x = "Contribution to sentiment",
+          y = NULL)
+
+f <- ggarrange(A, B,
+               labels = NULL,
+               ncol = 2, nrow = 1)
+annotate_figure(f,
+               top = text_grob("Total Description Terms", 
+                               color = "Black", 
+                               size = 14))
+
+
+######################################################
+
+rtidy_desc <- ona_df %>% 
+  mutate(rating = case_when( 
+                            rating >= 3.5 ~ "good",
+                            rating < 3.5 ~  "bad")) %>% 
+  select(-c(pos_sentiment)) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+
+rtidy_desc %>% 
+  count(rating, word, sort = TRUE) %>%
+  group_by(rating) %>%
+  slice_max(n, n = 10) %>% 
+  mutate(word = reorder(word, n))
+
+A <- rtidy_desc %>% 
+     count(rating, word, sort = TRUE) %>%
+     ungroup() %>% 
+     filter(rating=="bad") %>% 
+     slice_max(n, n = 10) %>% 
+     mutate(word = reorder(word, n)) %>%
+     ggplot(aes(n, word)) +
+     geom_col(show.legend = FALSE, fill="#F8766D") +
+     facet_wrap(~rating, scales = "free_y") +
+     labs(x = "Contribution to sentiment",
+          y = NULL)
+
+B <- rtidy_desc %>% 
+     count(rating, word, sort = TRUE) %>%
+     ungroup() %>% 
+     filter(rating=="good") %>% 
+     slice_max(n, n = 10) %>% 
+     mutate(word = reorder(word, n)) %>%
+     ggplot(aes(n, word)) +
+     geom_col(show.legend = FALSE, fill="#00BFC4") +
+     facet_wrap(~rating, scales = "free_y") +
+     labs(x = "Contribution to sentiment",
+          y = NULL)
+
+f <- ggarrange(A, B,
+               labels = NULL,
+               ncol = 2, nrow = 1)
+annotate_figure(f,
+               top = text_grob("Total Description Terms", 
+                               color = "Black", 
+                               size = 14))
+
+
+
+```
+&nbsp;&nbsp;
+
+Obtain descriptive term associations with product sentiment (or rating).
+
+&nbsp;&nbsp;
+```{r}
+
+tidy_desc %>% 
+  count(sentiment, word, sort = TRUE) %>%
+  ungroup() %>% 
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>% 
+  mutate(positive=positive/sum(positive), negative=negative/sum(negative)) %>% 
+  mutate(diff = positive-negative) %>% 
+  arrange(desc(diff)) %>% 
+  filter(diff!=0) %>% 
+  mutate(emphasis = case_when( 
+                          diff > 0 ~ "positive associated",
+                          diff < 0 ~ "negative associated"), 
+         diff=abs(diff)) %>% 
+  group_by(emphasis) %>% 
+  slice_max(diff, n=15) %>% 
+  select(-c(positive, negative)) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, diff)) %>%
+  ggplot(aes(diff, word, fill = emphasis)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~emphasis, scales = "free_y") +
+  labs(x = "Description Frequency - Product Sentiment Association",
+       y = NULL) +
+  ggtitle("Term Association with Product Sentiment") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+######################################################
+
+
+rtidy_desc %>% 
+  count(rating, word, sort = TRUE) %>%
+  ungroup() %>% 
+  pivot_wider(names_from = rating, values_from = n, values_fill = 0) %>% 
+  mutate(good=good/sum(good), bad=bad/sum(bad)) %>% 
+  mutate(diff = good-bad) %>% 
+  arrange(desc(diff)) %>% 
+  filter(diff!=0) %>% 
+  mutate(emphasis = case_when( 
+                          diff > 0 ~ "positive associated",
+                          diff < 0 ~ "negative associated"), 
+         diff=abs(diff)) %>% 
+  group_by(emphasis) %>% 
+  slice_max(diff, n=15) %>% 
+  select(-c(good, bad)) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, diff)) %>%
+  ggplot(aes(diff, word, fill = emphasis)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~emphasis, scales = "free_y") +
+  labs(x = "Description Frequency - Product Rating Association",
+       y = NULL) +
+  ggtitle("Term Association with Product Rating") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+&nbsp;&nbsp;
+
+Looks like hair, scalp, eye make-up lean more negative, while face, skin, lips, and fragrance lean more positive.
+
+Associated Wordcloud
+
+&nbsp;&nbsp;
+```{r, fig.align='center'}
+
+set.seed(7)
+library(wordcloud)
+library(reshape2)
+
+
+rtidy_desc  %>%
+  count(word, rating, sort = TRUE) %>%
+  acast(word ~ rating, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("red", "blue"),
+                   max.words = 100)
+  
+
+    
+```
+&nbsp;&nbsp;
+
+Best rating and sentiment brand analysis. Reporting average price of top 10.
+
+&nbsp;&nbsp;
+```{r, fig.align='center', fig.height=6, fig.width=8}
+
+# set hyper-parameter
+alpha <- 0.6
+
+# merge sentiments with reviews, keep number of reviews first
+ona_df <- ona_df_og %>% 
+  inner_join(rev_sents, by="id") %>% 
+  group_by(id) %>%
+  slice_max(rev_num) %>% 
+  ungroup() %>% 
+  select(-c(reviews))
+
+# by brand
+brand_desc <- ona_df %>% 
+  select(c(text, rating, price, brand, pos_sentiment, rev_num)) %>% 
+  group_by(brand) %>% 
+  summarise(text=paste0(text, collapse = " "), 
+            rating=mean(rating), 
+            price=mean(price),
+            pos_sentiment=mean(pos_sentiment),
+            rev_num=sum(rev_num))
+
+# top 10 sentiment & rated brands
+top10 <- brand_desc %>% 
+  filter(rev_num > 25) %>% 
+  select(-c(text)) %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  arrange(desc(mixed_rating), rev_num) %>% 
+  head(n=10)
+
+cat("Mean price of brands with top 10 highest rating / sentiment: $", 
+    mean(top10$price), "\n")
+cat("Mean price of all products: $", mean(ona_df$price), "\n")
+
+# by word
+tidy_brand <- brand_desc %>% 
+  filter(rev_num > 25) %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  arrange(desc(mixed_rating), rev_num) %>% 
+  head(n=6) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+
+L <- list()
+brands <- c("rituals", "montblanc", "azzaro", "skin-gym", 
+            "kate-spade-new-york", "idesign")
+for (i in 1:length(brands)) {
+  
+  L[[i]] <- tidy_brand %>% 
+            count(brand, word, sort = TRUE) %>%
+            bind_tf_idf(word, brand, n) %>% 
+            filter(brand==brands[i]) %>% 
+            filter(!(word %in% brands)) %>% 
+            group_by(brand) %>%
+            slice_max(tf_idf, n=6, with_ties=FALSE) %>% 
+            mutate(word=reorder(word, tf_idf)) %>% 
+            ggplot(aes(tf_idf, word)) +
+            geom_col(show.legend = FALSE, fill="#00BFC4") +
+            facet_wrap(~brand, scales = "free_y") +
+            labs(x = "TF-IDF",
+                 y = NULL)
+}
+
+f <- ggarrange(plotlist=L, 
+               labels = NULL,
+               ncol = 3, nrow = 2)
+
+annotate_figure(f,
+               top = text_grob(paste("Frequent terms in Best Rating &", 
+                                     "Sentiment Brands"), 
+                               color = "Black", 
+                               size = 14))
+    
+```
+&nbsp;&nbsp;
+
+Lowest rating and sentiment brand analysis. Reporting average price of worst 10.
+
+&nbsp;&nbsp;
+```{r, fig.align='center', fig.height=6, fig.width=8}
+
+# top 10 sentiment & rated brands
+top10 <- brand_desc %>% 
+  filter(rev_num > 25) %>% 
+  select(-c(text)) %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  arrange(mixed_rating, rev_num) %>% 
+  head(n=10) 
+
+cat("Mean price of brands with lowest 10 worst rating / sentiment: $", 
+    mean(top10$price), "\n")
+cat("Mean price of all products: $", mean(ona_df$price), "\n")
+
+# by word
+tidy_brand <- brand_desc %>% 
+  filter(rev_num > 25) %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  arrange(mixed_rating, rev_num) %>% 
+  head(n=6) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+
+L <- list()
+brands <- c("nair", "nads-natural", "hollywood-fashion-secrets") #, 
+            #"punky-colour", "pravana", "invisibobble")
+for (i in 1:length(brands)) {
+  
+  L[[i]] <- tidy_brand %>% 
+            count(brand, word, sort = TRUE) %>%
+            bind_tf_idf(word, brand, n) %>% 
+            filter(brand==brands[i]) %>% 
+            filter(!(word %in% brands)) %>% 
+            group_by(brand) %>%
+            slice_max(tf_idf, n=10, with_ties=FALSE) %>% 
+            mutate(word=reorder(word, tf_idf)) %>% 
+            ggplot(aes(tf_idf, word)) +
+            geom_col(show.legend = FALSE, fill="#F8766D") +
+            facet_wrap(~brand, scales = "free_y") +
+            labs(x = "TF-IDF",
+                 y = NULL)
+}
+
+f <- ggarrange(plotlist=L, 
+               labels = NULL,
+               ncol = 3, nrow = 1)
+
+annotate_figure(f,
+               top = text_grob(paste("Frequent terms in Worst Rated &", 
+                                     "Sentiment Brands"), 
+                               color = "Black", 
+                               size = 14))
+    
+```
+&nbsp;&nbsp;
+
+Best rating and sentiment product category analysis. Reporting average price of best 10.
+
+&nbsp;&nbsp;
+```{r, fig.align='center', fig.height=6, fig.width=8}
+
+# set hyper-parameter
+alpha <- 0.6
+
+# by product category
+product_cats <- ona_df %>% 
+  select(c(text, rating, price, class, pos_sentiment, rev_num)) %>% 
+  group_by(class) %>% 
+  summarise(text=paste0(text, collapse = " "), 
+            rating=mean(rating), 
+            price=mean(price),
+            pos_sentiment=mean(pos_sentiment),
+            rev_num=sum(rev_num))
+
+# top 10 sentiment & rated product classes
+top10 <- product_cats %>% 
+  filter(rev_num > 30) %>% 
+  select(-c(text)) %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  arrange(desc(mixed_rating), rev_num) %>% 
+  head(n=10)
+
+cat("Mean price of product categories with top 10 highest rating / sentiment: $", 
+    mean(top10$price), "\n")
+cat("Mean price of all products: $", mean(ona_df$price), "\n")
+
+# by word
+tidy_product_cat <- product_cats %>% 
+  filter(rev_num > 30) %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  arrange(desc(mixed_rating), rev_num) %>% 
+  head(n=6) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+
+L <- list()
+pclasses <- c("BeardCare", "Cologne", "BodyLotions", "MakeupBags&Organizers",
+            "AfterSunCare", "BodyLotion")
+for (i in 1:length(pclasses)) {
+
+  L[[i]] <- tidy_product_cat %>% 
+            count(class, word, sort = TRUE) %>%
+            bind_tf_idf(word, class, n) %>% 
+            filter(class==pclasses[i]) %>% 
+            group_by(class) %>%
+            slice_max(tf_idf, n=10, with_ties=FALSE) %>% 
+            mutate(word=reorder(word, tf_idf)) %>% 
+            ggplot(aes(tf_idf, word)) +
+            geom_col(show.legend = FALSE, fill="#00BFC4") +
+            facet_wrap(~class, scales = "free_y") +
+            labs(x = "TF-IDF",
+                 y = NULL)
+  
+}
+
+f <- ggarrange(plotlist=L, 
+               labels = NULL,
+               ncol = 3, nrow = 2)
+
+annotate_figure(f,
+               top = text_grob(paste("Frequent terms in Best Rating & Sentiment", 
+                                      "Product Categories"), 
+                               color = "Black", 
+                               size = 14))
+    
+```
+&nbsp;&nbsp;
+
+Lowest rating and sentiment product category analysis. Reporting average price of worst 10.
+
+&nbsp;&nbsp;
+```{r, fig.align='center', fig.height=6, fig.width=8}
+
+# set hyper-parameter
+alpha <- 0.6
+
+# top 10 sentiment & rated product classes
+top10 <- product_cats %>% 
+  filter(rev_num > 30) %>% 
+  select(-c(text)) %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  arrange(mixed_rating, rev_num) %>% 
+  head(n=10)
+
+cat("Mean price of product categories with lowest 10 worst rating / sentiment: $", 
+    mean(top10$price), "\n")
+cat("Mean price of all products: $", mean(ona_df$price), "\n")
+
+# by word
+tidy_product_cat <- product_cats %>% 
+  filter(rev_num > 30) %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  arrange(mixed_rating, rev_num) %>% 
+  head(n=6) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+
+L <- list()
+pclasses <- c("HairRollers", "EyeMakeupRemover", "HairRemovalTools", 
+              "HairColor&Bleach", "Trend&FashionAccessories", "SelfCare&Wellness")
+for (i in 1:length(pclasses)) {
+  
+  
+  L[[i]] <- tidy_product_cat %>% 
+            count(class, word, sort = TRUE) %>%
+            bind_tf_idf(word, class, n) %>% 
+            filter(class==pclasses[i]) %>% 
+            group_by(class) %>%
+            slice_max(tf_idf, n=10, with_ties=FALSE) %>% 
+            mutate(word=reorder(word, tf_idf)) %>% 
+            ggplot(aes(tf_idf, word)) +
+            geom_col(show.legend = FALSE, fill="#F8766D") +
+            facet_wrap(~class, scales = "free_y") +
+            labs(x = "TF-IDF",
+                 y = NULL)
+}
+
+f <- ggarrange(plotlist=L, 
+               labels = NULL,
+               ncol = 3, nrow = 2)
+
+annotate_figure(f,
+               top = text_grob(paste("Frequent terms in Worst Rating &", 
+                                     "Sentiment Product Categories"), 
+                               color = "Black", 
+                               size = 14))
+    
+```
+&nbsp;&nbsp;
+
+Assess best brand descriptions within specific product classes. Use categories, shampoo, face-moisturizer, and mascara.
+
+&nbsp;&nbsp;
+```{r}
+
+product_brands <- ona_df %>% 
+  filter(class=="Shampoo" | class=="FaceMoisturizer" | class=="Mascara") %>% 
+  select(c(text, rating, price, class, brand, pos_sentiment, rev_num)) %>% 
+  group_by(class, brand) %>% 
+  summarise(text=paste0(text, collapse = " "), 
+            rating=mean(rating), 
+            price=mean(price),
+            pos_sentiment=mean(pos_sentiment),
+            rev_num=sum(rev_num)) %>% 
+  ungroup()
+  
+# print list of top brands for each group
+product_brands %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  group_by(class) %>% 
+  slice_max(mixed_rating, n=4, with_ties = FALSE) %>% 
+  select(class, brand) %>% 
+  print(n=12)
+
+tidy_brands <- product_brands %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  group_by(class) %>% 
+  slice_max(mixed_rating, n=4, with_ties = FALSE) %>% 
+  group_by(class, brand) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+  
+
+pclasses <- c("Shampoo", "FaceMoisturizer", "Mascara")
+
+for (i in 1:length(pclasses)) {
+  
+  print(tidy_brands %>% 
+    filter(class==pclasses[i]) %>% 
+    count(brand, word, sort = TRUE) %>%
+    bind_tf_idf(word, brand, n) %>% 
+    group_by(brand) %>%
+    slice_max(tf_idf, n=10, with_ties=FALSE) %>% 
+    mutate(word=reorder(word, tf_idf)) %>% 
+    ggplot(aes(tf_idf, word)) +
+    geom_col(show.legend = FALSE, fill="#00BFC4") +
+    facet_wrap(~brand, scales = "free_y") +
+    labs(x = "TF-IDF",
+         y = NULL, 
+         title = paste("Product Category:", pclasses[i])))
+    
+  
+}
+    
+```
+&nbsp;&nbsp;
+
+Assess worst rated brand descriptions within specific product classes. Use categories, shampoo, face-moisturizer, and mascara.
+
+&nbsp;&nbsp;
+```{r}
+  
+# print list of top brands for each group
+product_brands %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  group_by(class) %>% 
+  slice_min(mixed_rating, n=4, with_ties = FALSE) %>% 
+  select(class, brand, mixed_rating) %>% 
+  print(n=12)
+
+tidy_brands <- product_brands %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  group_by(class) %>% 
+  slice_min(mixed_rating, n=4, with_ties = FALSE) %>% 
+  group_by(class, brand) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+  
+
+pclasses <- c("Shampoo", "FaceMoisturizer", "Mascara")
+
+for (i in 1:length(pclasses)) {
+  
+  print(tidy_brands %>% 
+    filter(class==pclasses[i]) %>% 
+    count(brand, word, sort = TRUE) %>%
+    bind_tf_idf(word, brand, n) %>% 
+    group_by(brand) %>%
+    slice_max(tf_idf, n=10, with_ties=FALSE) %>% 
+    mutate(word=reorder(word, tf_idf)) %>% 
+    ggplot(aes(tf_idf, word)) +
+    geom_col(show.legend = FALSE, fill="#F8766D") +
+    facet_wrap(~brand, scales = "free_y") +
+    labs(x = "TF-IDF",
+         y = NULL, 
+         title = paste("Product Category:", pclasses[i])))
+    
+  
+}
+    
+```
+&nbsp;&nbsp;
+
+
+Assess best product class descriptions within specific brand. Using brands peach-lily and colourpop.
+
+&nbsp;&nbsp;
+```{r}
+
+product_cats <- ona_df %>% 
+  filter(brand =="peach-lily" | brand == "colourpop") %>% 
+  select(c(text, rating, price, class, brand, pos_sentiment, rev_num)) %>% 
+  group_by(brand, class) %>% 
+  summarise(text=paste0(text, collapse = " "), 
+            rating=mean(rating), 
+            price=mean(price),
+            pos_sentiment=mean(pos_sentiment),
+            rev_num=sum(rev_num)) %>% 
+  ungroup()
+  
+# print list of top cats for each brand
+product_cats %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  group_by(brand) %>% 
+  slice_max(mixed_rating, n=4, with_ties = FALSE) %>% 
+  select(class, brand) %>% 
+  print(n=8)
+
+tidy_cats <- product_cats %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  group_by(brand) %>% 
+  slice_max(mixed_rating, n=4, with_ties = FALSE) %>% 
+  group_by(class, brand) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+  
+brands <- c("peach-lily", "colourpop")
+
+for (i in 1:length(brands)) {
+  
+  print(tidy_cats %>% 
+    filter(brand==brands[i]) %>% 
+    count(class, word, sort = TRUE) %>%
+    bind_tf_idf(word, class, n) %>% 
+    group_by(class) %>%
+    slice_max(tf_idf, n=10, with_ties=FALSE) %>% 
+    mutate(word=reorder_within(word, tf_idf, class)) %>% 
+    ggplot(aes(tf_idf, word)) +
+    geom_col(show.legend = FALSE, fill="#00BFC4") +
+    facet_wrap(~class, scales = "free_y") +
+    scale_y_reordered() +
+    labs(x = "TF-IDF",
+         y = NULL, 
+         title = paste("Brand:", brands[i])))
+    
+  
+}
+    
+    
+```
+&nbsp;&nbsp;
+
+Assess worst rated brand descriptions within specific product classes. Using brands peach-lily and colourpop.
+
+&nbsp;&nbsp;
+```{r}
+
+# print list of top cats for each brand
+product_cats %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  group_by(brand) %>% 
+  slice_min(mixed_rating, n=4, with_ties = FALSE) %>% 
+  select(class, brand) %>% 
+  print(n=8)
+
+tidy_cats <- product_cats %>% 
+  mutate(mixed_rating=alpha*pos_sentiment+(1-alpha)*(rating/5)) %>% 
+  group_by(brand) %>% 
+  slice_min(mixed_rating, n=4, with_ties = FALSE) %>% 
+  group_by(class, brand) %>% 
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+  
+brands <- c("peach-lily", "colourpop")
+
+for (i in 1:length(brands)) {
+  
+  print(tidy_cats %>% 
+    filter(brand==brands[i]) %>% 
+    count(class, word, sort = TRUE) %>%
+    bind_tf_idf(word, class, n) %>% 
+    group_by(class) %>%
+    slice_max(tf_idf, n=10, with_ties=FALSE) %>% 
+    mutate(word=reorder_within(word, tf_idf, class)) %>% 
+    ggplot(aes(tf_idf, word)) +
+    geom_col(show.legend = FALSE, fill="#F8766D") +
+    facet_wrap(~class, scales = "free_y") +
+    scale_y_reordered() +
+    labs(x = "TF-IDF",
+         y = NULL, 
+         title = paste("Brand:", brands[i])))
+    
+  
+}
+    
+    
+```
+&nbsp;&nbsp;
+
+## Topic Modeling
+
+Create corpus.
+
+&nbsp;&nbsp;
+```{r}
+
+library(tm)
+
+brands_df <- ona_df %>% 
+  select(c(text, rating, price, class, brand, pos_sentiment, rev_num)) %>% 
+  group_by(brand) %>% 
+  summarise(text=paste0(text, collapse = " "), 
+            rating=mean(rating), 
+            price=mean(price),
+            pos_sentiment=mean(pos_sentiment),
+            rev_num=sum(rev_num)) %>% 
+  ungroup()
+
+# tidy desc data by brand
+tidy_brands <- brands_df %>%
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words)
+  
+
+# cast tidy data into dtm
+dtm <- tidy_brands %>%
+  count(brand, word, sort=TRUE) %>%
+  cast_dtm(brand, word, n)
+
+# inspect dtm
+dtm %>% inspect()
+    
+    
+```
+&nbsp;&nbsp;
+
+Build topic models.
+
+&nbsp;&nbsp;
+```{r}
+
+library(topicmodels)
+options(scipen=2)
+
+brands_lda <- LDA(dtm, k = 3, control = list(seed = 1234))
+brands_lda
+    
+    
+```
+&nbsp;&nbsp;
+
+Terms that are most common within each topic.
+
+&nbsp;&nbsp;
+```{r}
+
+brands_topics <- tidy(brands_lda, matrix = "beta")
+
+brands_top_terms <- brands_topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+brands_top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered() + 
+  ggtitle("Most Common Words In Each Topic")
+    
+```
+&nbsp;&nbsp;
+
+Topic 3 appears to be hair related, topic 2 looks like facial and body cleansers/moisturizers, and topic 1 looks like makeup and lashes.
+
+Now we look at the each brands probability of being in each topic.
+
+&nbsp;&nbsp;
+```{r}
+
+brand_documents <- tidy(brands_lda, matrix = "gamma")
+brand_documents
+
+brand_documents %>%
+  group_by(topic) %>%
+  slice_max(gamma, n = 10) %>% 
+  ungroup() %>%
+  arrange(topic, -gamma) %>% 
+  select(c(document, topic)) %>% 
+  print(n=30)
+
+```
+&nbsp;&nbsp;
+
+Brands sufficiently match topics as described above.
+
+&nbsp;
+
+Price differences, ratings, and sentiment between clusters.
+
+&nbsp;&nbsp;
+```{r}
+
+brand_topics <- brand_documents %>% 
+  group_by(document) %>% 
+  slice_max(gamma) %>% 
+  mutate(brand=document) %>% 
+  select(-c(document, gamma))
+
+brands_df <- brands_df %>% 
+  left_join(brand_topics)
+
+brands_df %>% 
+  group_by(topic) %>% 
+  summarise(Topic.Price = mean(price),
+            Topic.Rating = mean(rating),
+            Topic.Sentiment = mean(pos_sentiment))
+
+
+```
+&nbsp;&nbsp;
+
+Nothing substantially different. 
+
+## Correlation Plots
+
+Using the clusters 2 and 3, plots.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE, fig.width=6, fig.height=4}
+
+library(scales)
+
+
+# tidy desc data by brand
+tidy_brands <- brands_df %>%
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words) %>% 
+  mutate(topic = paste0("topic", topic))
+
+frequency <- tidy_brands %>%
+  count(topic, word) %>%
+  group_by(topic) %>%
+  mutate(proportion = n / sum(n)) %>% 
+  select(-n) %>% 
+  pivot_wider(names_from = topic, values_from = proportion) %>% 
+  pivot_longer(topic2:topic3,
+               names_to = "topic", values_to = "proportion")
+
+# expect a warning about rows with missing values being removed
+ggplot(frequency, aes(x = proportion, y = topic1, 
+                      color = abs(topic1 - proportion))) +
+  geom_abline(color = "gray40", lty = 2) +
+  geom_jitter(alpha = 0.1, size = 2.5, width = 0.3, height = 0.3) +
+  geom_text(aes(label = word), check_overlap = TRUE, vjust = 1.5) +
+  scale_x_log10(labels = percent_format()) +
+  scale_y_log10(labels = percent_format()) +
+  scale_color_gradient(limits = c(0, 0.001), 
+                       low = "darkslategray4", high = "gray75") +
+  facet_wrap(~topic, ncol = 2) +
+  theme(legend.position="none") +
+  labs(y = "topic1", x = NULL)
+
+```
+&nbsp;&nbsp;
+
+Using the clusters 2 and 3, estimates.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+# t3 vs t1
+cor.test(data = frequency[frequency$topic == "topic3",],
+         ~ proportion + topic1)
+
+# t2 vs t1
+cor.test(data = frequency[frequency$topic == "topic2",],
+         ~ proportion + topic1)
+
+# t2 vs t3
+cor.test(frequency$proportion[frequency$topic == "topic2"], 
+         frequency$proportion[frequency$topic == "topic3"])
+
+```
+&nbsp;&nbsp;
+
+
+Using two different brands, plots.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE, fig.width=6, fig.height=4}
+
+
+frequency <- tidy_brands %>%
+  filter(brand=="loreal" | brand=="colourpop" | brand=="maybelline") %>% 
+  count(brand, word) %>%
+  group_by(brand) %>%
+  mutate(proportion = n / sum(n)) %>% 
+  select(-n) %>% 
+  pivot_wider(names_from = brand, values_from = proportion) %>% 
+  pivot_longer(c(`colourpop`, `maybelline`),
+               names_to = "brand", values_to = "proportion")
+
+# expect a warning about rows with missing values being removed
+ggplot(frequency, aes(x = proportion, y = loreal, 
+                      color = abs(loreal - proportion))) +
+  geom_abline(color = "gray40", lty = 2) +
+  geom_jitter(alpha = 0.1, size = 2.5, width = 0.3, height = 0.3) +
+  geom_text(aes(label = word), check_overlap = TRUE, vjust = 1.5) +
+  scale_x_log10(labels = percent_format()) +
+  scale_y_log10(labels = percent_format()) +
+  scale_color_gradient(limits = c(0, 0.001), 
+                       low = "darkslategray4", high = "gray75") +
+  facet_wrap(~brand, ncol = 2) +
+  theme(legend.position="none") +
+  labs(y = "loreal", x = NULL)
+
+```
+&nbsp;&nbsp;
+
+Using the brands, estimates.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+# loreal vs maybelline
+cor.test(data = frequency[frequency$brand == "maybelline",],
+         ~ proportion + loreal)
+
+# loreal vs colourpop
+cor.test(data = frequency[frequency$brand == "colourpop",],
+         ~ proportion + loreal)
+
+# loreal vs colourpop
+cor.test(frequency$proportion[frequency$brand == "colourpop"], 
+         frequency$proportion[frequency$brand == "maybelline"])
+
+
+```
+&nbsp;&nbsp;
+
+What else makes colourpop different from the other two? 
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+l_vs_c <- tidy_brands %>%
+  filter(!word %in% c("loréal", "loreal", "loreals")) %>% 
+  filter(brand=="loreal" | brand=="colourpop") %>% 
+  count(brand, word) %>%
+  group_by(brand) %>% 
+  pivot_wider(names_from = brand, values_from = n, values_fill = 0) %>% 
+  mutate_if(is.numeric, list(~(. + 1) / (sum(.) + 1))) %>%
+  mutate(logratio = log(loreal / colourpop)) %>%
+  arrange(desc(logratio)) 
+
+l_vs_c %>%
+  group_by(logratio < 0) %>%
+  slice_max(abs(logratio), n = 15) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, logratio)) %>%
+  ggplot(aes(word, logratio, fill = logratio < 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  ylab("log odds ratio (loreal/colourpop)") +
+  scale_fill_discrete(name = "", labels = c("loreal", "colourpop")) + 
+  ggtitle("Term Frequencies with the Largest Differences")
+
+l_vs_m <- tidy_brands %>%
+  filter(!word %in% c("loréal", "maybelline", "maybellines")) %>% 
+  filter(brand=="loreal" | brand=="maybelline") %>% 
+  count(brand, word) %>%
+  group_by(brand) %>% 
+  pivot_wider(names_from = brand, values_from = n, values_fill = 0) %>% 
+  mutate_if(is.numeric, list(~(. + 1) / (sum(.) + 1))) %>%
+  mutate(logratio = log(loreal / `maybelline`)) %>%
+  arrange(desc(logratio))
+
+l_vs_m %>%
+  group_by(logratio < 0) %>%
+  slice_max(abs(logratio), n = 15) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, logratio)) %>%
+  ggplot(aes(word, logratio, fill = logratio < 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  ylab("log odds ratio (loreal/maybelline)") +
+  scale_fill_discrete(name = "", labels = c("loreal", "maybelline")) + 
+  ggtitle("Term Frequencies with the Largest Differences")
+
+c_vs_m <- tidy_brands %>%
+  filter(!word %in% c("maybelline", "maybellines", "colourpops")) %>% 
+  filter(brand=="colourpop" | brand=="maybelline") %>% 
+  count(brand, word) %>%
+  group_by(brand) %>% 
+  pivot_wider(names_from = brand, values_from = n, values_fill = 0) %>% 
+  mutate_if(is.numeric, list(~(. + 1) / (sum(.) + 1))) %>%
+  mutate(logratio = log(colourpop / maybelline)) %>%
+  arrange(desc(logratio)) 
+
+c_vs_m %>%
+  group_by(logratio < 0) %>%
+  slice_max(abs(logratio), n = 15) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, logratio)) %>%
+  ggplot(aes(word, logratio, fill = logratio < 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  ylab("log odds ratio (colourpop / maybelline)") +
+  scale_fill_discrete(name = "", labels = c("colourpop", "maybelline")) + 
+  ggtitle("Term Frequencies with the Largest Differences")
+
+```
+&nbsp;&nbsp;
+
+Colourpop is a bit more Gen. Z (hip, colorful, cool) while maybelline and loreal are a bit more millennials.
+

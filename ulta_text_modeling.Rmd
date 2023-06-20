@@ -1,0 +1,754 @@
+---
+title: "Ulta Text Modeling"
+author: Andrew Mashhadi
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: pdf_document
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen=999)
+```
+
+# Load Libraries
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidytext) 
+library(ROCR)
+library(pROC)
+library(caret)
+library(broom)
+library(ggplot2)
+library(ggpubr)
+library(randomForest)
+library(purrr)
+library(tm)
+library(tidyr)
+library(stringr)
+library(SnowballC)
+```
+
+# Modeling
+
+Reading in the the full dataframe of webscraped data \texttt{full\_df}.
+
+&nbsp;&nbsp;
+```{r}
+
+## set data path
+PATH_ULTA_TEXT_DIR <- Sys.getenv("ULTA_TEXT_DATA")
+PATH_ULTA_PRODUCT_NAMES <-paste0(PATH_ULTA_TEXT_DIR, '/products/product_dict.csv')
+
+## read in product names
+product_names <- read.csv(PATH_ULTA_PRODUCT_NAMES)[, 2:3]
+
+## get full paths to all data files
+csv_files <- list.files(PATH_ULTA_TEXT_DIR, pattern = "csv$", full.names = T)
+brand_names <- list.files(PATH_ULTA_TEXT_DIR, pattern = "csv$", full.names = F)
+
+# initiallize df
+full_df <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(full_df) <- c('id', 'class', 'text', 'reviews', 
+                       'rating', 'price', 'brand')
+
+## read in product names
+for (i in 1:length(csv_files)) {
+  
+  tmp <- read.csv(csv_files[i])[, 2:7]
+
+  tmp <- tmp %>% 
+    mutate(brand=str_replace(brand_names[i], ".csv", ""))
+  
+  full_df <- rbind(full_df, tmp)
+  
+}
+
+# remove duplicates (sometimes same product page woudl appear a few times)
+full_df <- full_df %>% 
+  distinct()
+
+full_df <- full_df %>% 
+  group_by(id) %>% 
+  mutate(rev_num=1:n()) %>% 
+  ungroup()
+
+
+# join with product names found seperately
+full_df <- full_df %>% 
+   inner_join(product_names %>% 
+                distinct())
+
+
+ona_df_og <- full_df %>% 
+   na.omit() %>% 
+   filter(reviews != "")
+
+
+```
+&nbsp;&nbsp;
+
+## Part (1)
+
+Model to predict product rating from review text.
+
+We begin with a setup for train/test split.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+# set seed 
+set.seed(7)
+
+revs_df <- ona_df_og %>% 
+  select(c(id, rating, reviews)) %>% 
+  group_by(id) %>% 
+  summarise(review=paste0(reviews, collapse = " "), 
+            rating=mean(rating)) %>% 
+  ungroup()
+
+# train test split
+train.ind <- sample(1:nrow(revs_df), 
+                    replace = FALSE, 
+                    size=floor(0.80 * nrow(revs_df)))
+
+train_revs <- revs_df[train.ind, ]
+
+# tidy revs data by brand
+tidy_train_revs <- train_revs %>%
+  unnest_tokens(word, review) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words) %>% 
+  mutate(word = wordStem(word))
+  
+# cast tidy data into dtm
+dtm_train <- tidy_train_revs %>%
+  count(id, word, sort=TRUE) %>%
+  cast_dtm(id, word, n)
+
+# remove extremely sparse terms
+dtm_train <- removeSparseTerms(dtm_train, 0.995)
+
+# inspect corpus
+dtm_train %>% inspect()
+
+# make syntactically valid names
+colnames(dtm_train) = make.names(colnames(dtm_train)) 
+
+# convert dtm to df
+train.data <- dtm_train %>% 
+  as.matrix() %>% 
+  as.data.frame()
+
+# make id a column
+train.data$id <- as.numeric(rownames(train.data))
+
+# join the Y values, rating
+train <- train.data %>% 
+  left_join(revs_df %>% 
+               select(c(id, rating)),
+            by="id")
+
+```
+&nbsp;&nbsp;
+
+Validate using the training set with 5-fold CV. Then train on full training data.
+
+&nbsp;&nbsp;
+```{r, eval=FALSE}
+
+## Validation for tuning mtry 
+
+rfGrid <- expand.grid(.mtry = c(floor(sqrt(ncol(train))), 
+                                floor(ncol(train)/6),
+                                floor(ncol(train)/3),
+                                floor(ncol(train)/2)))
+
+tr.control <- trainControl(method = "cv", 
+                           number=4, 
+                           search = 'grid', 
+                           verboseIter = TRUE)
+
+cv_rf_model <- train(rating ~ . -id, 
+                       data = train, 
+                       method = "rf", 
+                       metric = "RMSE", 
+                       tuneGrid = rfGrid,
+                       ntree=100,
+                       trControl = tr.control)
+
+# print validation metrics
+print(cv_rf_model)
+
+# print validation metrics
+ggplot(cv_rf_model) + 
+  geom_point(colour = "red", size = 4) + 
+  geom_line(colour = "red", size = 2) + 
+  ggtitle("4-Fold CV Tuning")
+
+# save tuning image
+ggsave(paste0("images/rev_cv_rf_tuning.png"))
+
+
+## Train with full dataset now
+
+start.time <- Sys.time() # start timer
+
+model_rf <- randomForest(rating ~ .-id, 
+                         data = train, 
+                         mtry = floor(ncol(train)/6), # from tuning
+                         ntree = 500) 
+
+elapsed.time <- round((Sys.time() - start.time), 3) # stop timer
+
+# report train time
+cat("Finished training in ", elapsed.time, " minutes\n")
+
+# save time consuming data
+save.image("Rdata/models_checkpoint1.RData")
+
+```
+&nbsp;&nbsp;
+
+&nbsp;&nbsp;
+```{r}
+
+load("Rdata/models_checkpoint1.RData")
+
+# report train RMSE
+preds <- predict(model_rf, newdata = train)
+cat("Training RMSE: ", sqrt(mean((train$rating-preds)^2)))
+
+```
+&nbsp;&nbsp;
+
+Feature importances.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+# setup imp object
+imp <- varImpPlot(model_rf) %>% 
+  as.data.frame() %>% 
+  arrange(desc(IncNodePurity)) %>% 
+  head(n=15)
+
+imp$word <- rownames(imp) # row names to column
+
+imp <- imp %>% 
+  mutate(across('word', str_replace, 'terribl', 'terrible')) %>% 
+  mutate(across('word', str_replace, 'wast', 'waste')) %>% 
+  mutate(across('word', str_replace, 'aw', 'ful')) %>% 
+  mutate(across('word', str_replace, 'amaz', 'amazing')) %>% 
+  mutate(across('word', str_replace, 'horribl', 'horrible')) %>% 
+  left_join(get_sentiments("bing")) 
+
+imp %>% 
+ggplot(aes(x=reorder(word, IncNodePurity), weight=IncNodePurity, fill=sentiment)) + 
+  geom_bar() +
+  scale_fill_discrete(name="Variable Group") +
+  ylab("IncNodePurity") +
+  xlab("Word") + 
+  ggtitle("Random Forest Feature Importances") +
+  coord_flip() + 
+  scale_fill_discrete(labels = c("Negative", "Positive", "Neutral"))
+
+ggsave(paste0("images/reviews_feat_imp.png"))
+
+
+```
+&nbsp;&nbsp;
+
+Testing Performance.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+test_revs <- revs_df[-train.ind, ]
+
+# tidy revs data by brand
+tidy_test_revs <- test_revs %>%
+  unnest_tokens(word, review) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words) %>% 
+  mutate(word = wordStem(word))
+
+  
+# cast tidy data into dtm
+dtm_test <- tidy_test_revs %>%
+  count(id, word, sort=TRUE) %>%
+  cast_dtm(id, word, n)
+
+# make syntactically valid names
+colnames(dtm_test) = make.names(colnames(dtm_test)) 
+
+# convert dtm to df
+test.data <- dtm_test %>% 
+  as.matrix() %>% 
+  as.data.frame()
+
+# make id a column
+test.data$id <- as.numeric(rownames(test.data))
+
+# join the Y values, rating
+test <- test.data %>% 
+  left_join(revs_df %>% 
+               select(c(id, rating)),
+            by="id")
+
+preds <- predict(model_rf, newdata = test)
+
+cat("Testing RMSE: ", sqrt(mean((test$rating-preds)^2)), "\n")
+
+
+rss <- sum((preds - test$rating) ^ 2)  ## residual sum of squares
+tss <- sum((test$rating - mean(test$rating)) ^ 2)  ## total sum of squares
+rsq <- 1 - rss/tss
+
+cat("Testing R^2: ", 1 - rss/tss)
+```
+&nbsp;&nbsp;
+
+## Part (2)
+
+Model (find relationship) between sentiment and price.
+
+First, we get the sentiments again.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+options(scipen=2)
+
+tidy_revs <- ona_df_og %>%
+   unnest_tokens(word, reviews) %>%
+   filter(!grepl('[0-9]', word)) %>%
+   mutate(word = str_remove_all(word, "[:punct:]")) %>%
+   anti_join(stop_words)
+
+# get sentiments for each review
+rev_sents <- tidy_revs %>%
+  inner_join(get_sentiments("afinn")) %>%
+  group_by(id, rev_num) %>%
+  summarise(sentiment = sum(value))
+
+# treat each review equally (with weight) then get prop. positive
+rev_sents <- rev_sents %>%
+  filter(sentiment != 0) %>%
+  mutate(sentiment=as.integer(sentiment > 0)) %>%
+  group_by(id) %>%
+  summarise(pos_sentiment=mean(sentiment))
+
+# merge sentiments with reviews
+ona_df <- ona_df_og %>%
+  inner_join(rev_sents, by="id") %>%
+  group_by(id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-c(reviews, rev_num))
+
+
+```
+&nbsp;&nbsp;
+
+Now we model using the entire dataset.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+df <- ona_df %>%
+  filter(pos_sentiment != 0.5) %>%
+  mutate(sentiment = case_when(
+                            pos_sentiment < 0.5 ~ "negative",
+                            pos_sentiment > 0.5 ~ "positive"))
+df$sentiment <- factor(df$sentiment)
+
+
+summary(glm(sentiment~price, data=df, family = "binomial"))
+
+```
+&nbsp;&nbsp;
+
+Significant. Over all product classes, it appears that an increase in price corresponds to a more positive sentiment.
+
+Now we perform the same over each individual product type.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+
+# set up tibbles with nesting
+nested_data <- df %>% 
+  select(c(class, sentiment, price)) %>% 
+  nest(data = c(-class)) 
+
+
+# create log-reg model for each product category
+nested_models <- nested_data %>%
+  mutate(models = map(data, ~ glm(sentiment ~ price, ., 
+                                  family = "binomial")))
+
+
+# store model summarys in unnested format
+slopes <- nested_models %>%
+  mutate(models = map(models, tidy)) %>%
+  unnest(cols = c(models)) %>% 
+  filter(term=="price")
+
+slopes %>% 
+  filter(p.value < 0.05) %>% 
+  arrange(p.value)
+
+```
+&nbsp;&nbsp;
+
+Now we perform the same over each individual brand.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+
+# set up tibbles with nesting
+nested_data <- df %>% 
+  select(c(brand, sentiment, price)) %>% 
+  nest(data = c(-brand)) 
+
+
+# create log-reg model for each product category
+nested_models <- nested_data %>%
+  mutate(models = map(data, ~ glm(sentiment ~ price, ., 
+                                  family = "binomial")))
+
+# store model summarys in unnested format
+slopes <- nested_models %>%
+  mutate(models = map(models, tidy)) %>%
+  unnest(cols = c(models)) %>% 
+  filter(term=="price")
+
+slopes %>% 
+  filter(p.value < 0.05) %>% 
+  arrange(p.value)
+
+```
+&nbsp;&nbsp;
+
+Four different product categories and seven brands reported significant relationships (at the $\alpha=0.5$ level) between the price and sentiment. Both have a variety of positive or negative coefficients (log-odds).
+
+## Part (3)
+
+Model to predict rating from description text.
+
+We begin with a setup for train/test split.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+# set seed
+set.seed(7)
+
+desc_df <- ona_df_og %>% 
+  select(c(id, rating, text, price, class)) %>% 
+  group_by(id) %>% 
+  filter(row_number()==1)%>% 
+  ungroup()
+
+desc_df <- desc_df %>% 
+  mutate(rating= as.numeric(rating >= 4))
+
+# train test split
+train.ind <- sample(1:nrow(desc_df), 
+                    replace = FALSE, 
+                    size=floor(0.80 * nrow(desc_df)))
+
+train_desc <- desc_df[train.ind, ]
+
+# tidy texts data by brand
+tidy_train_desc <- train_desc %>%
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words) %>% 
+  mutate(word = wordStem(word))
+  
+# cast tidy data into dtm
+dtm_train <- tidy_train_desc %>%
+  count(id, word, sort=TRUE) %>%
+  cast_dtm(id, word, n)
+
+# remove extremely sparse terms
+dtm_train <- removeSparseTerms(dtm_train, 0.995)
+
+# inspect corpus
+dtm_train %>% inspect()
+
+# make syntactically valid names
+colnames(dtm_train) = make.names(colnames(dtm_train)) 
+
+# convert dtm to df
+train.data <- dtm_train %>% 
+  as.matrix() %>% 
+  as.data.frame()
+
+# make id a column
+train.data$id <- as.numeric(rownames(train.data))
+
+# join the Y values, rating
+train <- train.data %>% 
+  left_join(desc_df %>% 
+               select(c(id, rating)),
+            by="id")
+
+train$rating <- factor(train$rating)
+
+```
+&nbsp;&nbsp;
+
+Validate using the training set with 5-fold CV. Then train on full training data.
+
+&nbsp;&nbsp;
+```{r, eval=FALSE}
+
+## Validation for tuning mtry 
+
+levels(train$rating) <- c("no", "yes")
+
+rfGrid <- expand.grid(.mtry = c(floor(sqrt(ncol(train))/3),
+                                floor(sqrt(ncol(train))/2),
+                                floor(sqrt(ncol(train))), 
+                                floor(ncol(train)/6)))
+
+tr.control <- trainControl(method = "cv", 
+                           number=4, 
+                           search = 'grid', 
+                           classProbs = TRUE, 
+                           verboseIter = TRUE, 
+                           summaryFunction = twoClassSummary)
+
+cv_rf_model <- train(rating ~ . -id, 
+                       data = train, 
+                       method = "rf", 
+                       metric = "ROC", 
+                       tuneGrid = rfGrid,
+                       ntree=100,
+                       trControl = tr.control)
+
+levels(train$rating) <- c(0, 1)
+
+# print validation metrics
+print(cv_rf_model)
+
+# print validation metrics
+ggplot(cv_rf_model) + 
+  geom_point(colour = "red", size = 4) + 
+  geom_line(colour = "red", size = 2) + 
+  ggtitle("4-Fold CV Tuning") +
+  theme_minimal()
+
+# save tuning image
+ggsave(paste0("images/desc_cv_rf_tuning.png"))
+
+
+## Train with full dataset now
+
+start.time <- Sys.time() # start timer
+
+model_rf <- randomForest(rating ~ .-id, 
+                         data = train, 
+                         mtry = floor(sqrt(ncol(train))/2),  # from tuning
+                         ntree = 500) 
+
+elapsed.time <- round((Sys.time() - start.time), 3) # stop timer
+
+# report train time
+cat("Finished training in ", elapsed.time, " minutes\n")
+
+save.image("Rdata/models_checkpoint2.RData")
+
+```
+&nbsp;&nbsp;
+
+
+&nbsp;&nbsp;
+```{r}
+
+load("Rdata/models_checkpoint2.RData")
+
+# report train metrics
+preds <- predict(model_rf, newdata = train)
+cat("Training Accuracy: ", mean(train$rating == preds))
+
+```
+&nbsp;&nbsp;
+
+Feature importances.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+# setup imp object
+imp <- varImpPlot(model_rf) %>% 
+  as.data.frame() %>% 
+  arrange(desc(MeanDecreaseGini)) %>% 
+  head(n=11)
+
+imp$word <- rownames(imp) # row names to column
+
+imp %>% 
+ggplot(aes(x=reorder(word, MeanDecreaseGini), weight=MeanDecreaseGini)) + 
+  geom_bar() +
+  scale_fill_discrete(name="Variable Group") +
+  ylab("MeanDecreaseGini") +
+  xlab("Word") + 
+  ggtitle("Random Forest Feature Importances") +
+  coord_flip()
+  
+
+ggsave(paste0("images/desc_feat_imp.png"))
+
+
+```
+&nbsp;&nbsp;
+
+Notice the impact that hair and skin have on rating (as seen for sentiment analysis).
+
+Threshold calculation.
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+test_desc <- desc_df[-train.ind, ]
+
+# tidy revs data by brand
+tidy_test_desc <- test_desc %>%
+  unnest_tokens(word, text) %>% 
+  filter(!grepl('[0-9]', word)) %>%
+  mutate(word = str_remove_all(word, "[:punct:]")) %>%  
+  anti_join(stop_words) %>% 
+  mutate(word = wordStem(word))
+  
+# cast tidy data into dtm
+dtm_test <- tidy_test_desc %>%
+  count(id, word, sort=TRUE) %>%
+  cast_dtm(id, word, n)
+
+# make syntactically valid names
+colnames(dtm_test) = make.names(colnames(dtm_test)) 
+
+# convert dtm to df
+test.data <- dtm_test %>% 
+  as.matrix() %>% 
+  as.data.frame()
+
+# make id a column
+test.data$id <- as.numeric(rownames(test.data))
+
+# rename important vars
+#test.data <- test.data %>% 
+#  rename(rating.x = rating)
+
+# join the Y values, rating
+test <- test.data %>% 
+  left_join(desc_df %>% 
+               select(c(id, rating)),
+            by="id")
+
+# change to factor
+test$rating <- as.factor(test$rating)
+
+
+# set seed for validation split
+set.seed(77)
+
+val.ind <- sample(1:nrow(test), 
+                  replace = FALSE, 
+                  size=500)
+
+probs <- predict(model_rf, newdata = test[val.ind,], type="prob")[, 2]
+
+val_metrics <- data.frame()
+for (threshold in seq(0.31, 0.7, 0.01)){
+  val_threshold <- as.factor(as.numeric(probs > threshold))
+  val_table <- table(val_threshold, test$rating[val.ind])
+  temp <- confusionMatrix(val_table, positive = "1")
+  model <- "Random Forest"
+  temp <- data.frame(cbind(model, cbind(threshold, t(temp$byClass), t(temp$overall))))
+  val_metrics <- rbind(val_metrics, temp)
+}
+
+val_metrics %>%
+  select(model, threshold, Accuracy, Sensitivity, Specificity, Balanced.Accuracy) %>%
+  mutate_at(c("Sensitivity", "Accuracy", 
+              "Specificity", "Balanced.Accuracy"), as.numeric) %>%
+  mutate(Gmean = sqrt(Sensitivity * Specificity)) %>%
+  arrange(desc(Accuracy))
+
+
+```
+&nbsp;&nbsp;
+
+Testing Performance
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+# get test metrics
+probs <- predict(model_rf, newdata = test[-val.ind,], type="prob")[, 2]
+
+threshold <- as.factor(as.numeric(probs > 0.5))
+table <- table(threshold, test$rating[-val.ind])
+confusionMatrix(table, positive = "1")
+
+```
+&nbsp;&nbsp;
+
+ROC Curve
+
+&nbsp;&nbsp;
+```{r, warning=FALSE, message=FALSE}
+
+# train probs
+probs <- predict(model_rf, newdata = train, type="prob")[, 2]
+pred_train <- prediction(probs, train$rating)
+rocX <- roc(train$rating, probs)
+auc_train <- rocX$auc
+
+cat("ROC-AUC from Training Data: ", auc_train, "\n")
+
+
+# test probs
+probs <- predict(model_rf, newdata = test[-val.ind, ], type="prob")[, 2]
+pred_test <- prediction(probs, test$rating[-val.ind])
+rocX <- roc(test$rating[-val.ind], probs)
+auc_test <- rocX$auc
+
+cat("ROC-AUC from Testing Data: ", auc_test, "\n")
+
+
+# get training and testing ROC curve
+
+ptrain_df <- data.frame(x = performance(pred_train, "sens", "fpr")@x.values[[1]], 
+                     y = performance(pred_train, "sens", "fpr")@y.values[[1]])
+ptest_df <- data.frame(x = performance(pred_test, "sens", "fpr")@x.values[[1]], 
+                     y = performance(pred_test, "sens", "fpr")@y.values[[1]])
+
+cols <- c("#5CB85C", "#46B8DA")
+
+ggplot() + 
+  geom_line(data = ptest_df, aes(x = x, y = y), color = cols[2], lwd=1.5) + 
+  labs(color = "Model") + 
+  xlab("1 - Specifiicity (FPR)") + 
+  ylab("Sensitivity (TPR)") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dotted", 
+              color = "black", size = 0.5) +
+  theme(legend.position = "right") +
+  theme(legend.position="none") + 
+  ggtitle("ROC Curve")
+
+ggsave(paste0("images", "/desc_results_roc.png"))
+
+
+```
+
